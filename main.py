@@ -2,7 +2,8 @@
 """
 Lemmatize Comparison Tool
 
-2つのテキストファイルを比較し、reference に存在しない単語を抽出するツール。
+A tool to compare two text files and extract words that exist in the target file
+but not in the reference file.
 """
 
 import argparse
@@ -16,22 +17,22 @@ import spacy
 from spacy.language import Language
 
 def normalize_text(text: str) -> str:
-    """spaCy投入前の簡易正規化。
+    """Simple normalization before feeding to spaCy.
 
-    - 全角カンマ/句点を半角に寄せる
-    - 全角英数字/丸数字/ローマ数字などの互換文字を正規化（NFKC）
-    - 一部の記号（箇条書きなど）を空白に寄せて分割されやすくする
+    - Convert fullwidth commas/periods to halfwidth
+    - Normalize compatible characters like fullwidth alphanumerics, circled numbers, Roman numerals (NFKC)
+    - Replace certain symbols (bullets, etc.) with spaces for easier tokenization
     """
     normalized = unicodedata.normalize("NFKC", text)
 
-    # 日本語系の句読点はNFKCでもASCII化されないため、明示的に寄せる
-    # 期待挙動: 全角カンマは半角カンマに、全角ピリオドは ". " にする
+    # Japanese punctuation is not ASCII-fied by NFKC, so explicitly convert
+    # Expected behavior: fullwidth comma to halfwidth comma, fullwidth period to ". "
     normalized = normalized.replace("、", ", ")
     normalized = normalized.replace("，", ", ")
     normalized = normalized.replace("。", ". ")
     normalized = normalized.replace("．", ". ")
 
-    # 箇条書き/矢印など、単語の前にくっつきやすい記号は空白に寄せる
+    # Replace bullets, arrows, etc. that tend to stick to words with spaces
     normalized = normalized.translate(
         str.maketrans(
             {
@@ -45,19 +46,19 @@ def normalize_text(text: str) -> str:
         )
     )
 
-    # 波ダッシュ系（①～④ など）をASCII側に寄せる
+    # Convert wave dashes (e.g., in ①～④) to ASCII equivalents
     normalized = normalized.replace("～", "~")
     normalized = normalized.replace("〜", "~")
 
-    # 括弧系が単語にくっつくケース（例: "feet),the"）を分割しやすくする
+    # Add spaces around brackets to split cases where they stick to words (e.g., "feet),the")
     normalized = re.sub(r"([\[\]\(\){}])", r" \1 ", normalized)
 
-    # 教材由来の連番表記などを分離（例: "3.many" -> "3. many", ".There" -> ". There"）
-    # これにより、数字側は後段で落ち、英単語側は拾えるようになる。
+    # Separate numbered list notation from educational materials (e.g., "3.many" -> "3. many", ".There" -> ". There")
+    # This allows numbers to be dropped later while preserving the English words.
     normalized = re.sub(r"(\d)\.(?=[A-Za-z])", r"\1. ", normalized)
     normalized = re.sub(r"(^|\s)\.(?=[A-Za-z])", r"\1. ", normalized)
 
-    # 空白を軽く正規化（改行は維持）
+    # Light whitespace normalization (preserve line breaks)
     normalized = re.sub(r"[ \t]+", " ", normalized)
     normalized = re.sub(r" *\n *", "\n", normalized)
 
@@ -77,73 +78,36 @@ _CURRENCY_AMOUNT_RE = re.compile(r"^(?:[$£€])\d")
 # _SHORT_PREFIX_HYPHEN_NUM_RE = re.compile(r"^[a-z]{1,2}-\d+$")
 
 
-def _should_skip_lemma(lemma: str) -> bool:
-    """語彙として数えないトークン（教材のメタ情報・記号混入など）を除外する。"""
-    if not lemma:
-        return True
-
-    # 日本語（ひらがな/カタカナ/漢字）を除外
-    if _contains_cjk(lemma):
-        return True
-
-    # U.S / e.g. / l.10 / p.m. など「. を含む」略語・参照記法は除外
-    if "." in lemma:
-        return True
-
-    # 時刻など（9:30 など）は除外
-    if ":" in lemma:
-        return True
-
-    # 括弧・角括弧が残る断片は除外（例: "(2", "[your"）
-    if any(ch in lemma for ch in "()[]{}"):
-        return True
-
-    # 通貨+数字の断片は除外（$21, £15 など）
-    if _CURRENCY_AMOUNT_RE.match(lemma):
-        return True
-
-    # アルファベット1文字だけはノイズになりやすいので除外（a, b 等）
-    # ただし冠詞の a は残す
-    if len(lemma) == 1 and lemma != "a":
-        return True
-
-    # 英字/数字がまったく含まれないものは除外
-    if not any(c.isalpha() or c.isdigit() for c in lemma):
-        return True
-
-    return False
-
-
 def _skip_reason_for_lemma(lemma: str) -> str | None:
-    """除外理由を返す（除外しない場合は None）。"""
+    """Return the reason for exclusion (None if not excluded)."""
     if not lemma:
         return "empty"
 
     if _contains_cjk(lemma):
         return "contains_cjk"
 
-    # U.S / e.g. / l.10 / p.m. など「. を含む」略語・参照記法は除外
+    # Exclude abbreviations/references containing "." (e.g., U.S., e.g., l.10, p.m.)
     if "." in lemma:
         return "contains_dot"
 
-    # 時刻など（9:30 など）は除外
+    # Exclude time notation (e.g., 9:30)
     if ":" in lemma:
         return "contains_colon"
 
-    # 括弧・角括弧が残る断片は除外（例: "(2", "[your"）
+    # Exclude fragments with remaining brackets (e.g., "(2", "[your")
     if any(ch in lemma for ch in "()[]{}"): 
         return "contains_brackets"
 
-    # 通貨+数字の断片は除外（$21, £15 など）
+    # Exclude currency+number fragments (e.g., $21, £15)
     if _CURRENCY_AMOUNT_RE.match(lemma):
         return "currency_amount"
 
-    # アルファベット1文字だけはノイズになりやすいので除外（a, b 等）
-    # ただし冠詞の a は残す
+    # Exclude single letters as they tend to be noise (a, b, etc.)
+    # However, keep the article "a"
     if len(lemma) == 1 and lemma != "a":
         return "single_letter"
 
-    # 英字/数字がまったく含まれないものは除外
+    # Exclude if no alphabetic or numeric characters at all
     if not any(c.isalpha() or c.isdigit() for c in lemma):
         return "no_alnum"
 
@@ -151,9 +115,9 @@ def _skip_reason_for_lemma(lemma: str) -> str | None:
 
 
 def save_skipped_to_csv(skipped: Counter, filepath: Path) -> None:
-    """除外されたトークンを CSV に保存（頻度の降順）。
+    """Save skipped tokens to CSV (sorted by frequency descending).
 
-    skipped のキーは (token_text, lemma, reason) のタプル。
+    Keys in skipped are tuples of (token_text, lemma, reason).
     """
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
@@ -165,37 +129,37 @@ def save_skipped_to_csv(skipped: Counter, filepath: Path) -> None:
 
 
 def load_text(filepath: str) -> str:
-    """テキストファイルを UTF-8 で読み込む"""
+    """Load text file with UTF-8 encoding"""
     with open(filepath, "r", encoding="utf-8") as f:
         return normalize_text(f.read())
 
 
 def extract_lemmas(text: str, nlp: Language) -> tuple[Counter, Counter]:
     """
-    spaCy でテキストを解析し、lemmatize した単語の頻度をカウントする
+    Analyze text with spaCy and count lemmatized word frequencies
 
-    - 句読点・記号を除外
-    - 数字のみのトークンを除外
-    - 小文字に変換
-    - 固有名詞は含める
+    - Exclude punctuation and symbols
+    - Exclude numeric-only tokens
+    - Convert to lowercase
+    - Include proper nouns
     """
     doc = nlp(text)
     words = []
     skipped: Counter = Counter()
 
     for token in doc:
-        # 句読点・記号・空白を除外
+        # Exclude punctuation, symbols, and whitespace
         if token.is_punct or token.is_space:
             continue
 
-        # 数字のみのトークンを除外
+        # Exclude numeric-only tokens
         if token.like_num or token.text.isdigit():
             continue
 
-        # lemmatize して小文字に変換
+        # Lemmatize and convert to lowercase
         lemma = token.lemma_.lower()
 
-        # 日本語を含むトークンは除外（lemmatize 前後どちらでも落とす）
+        # Exclude tokens containing Japanese (drop whether before or after lemmatization)
         if _contains_cjk(token.text) or _contains_cjk(lemma):
             skipped[(token.text, lemma, "contains_cjk")] += 1
             continue
@@ -205,7 +169,7 @@ def extract_lemmas(text: str, nlp: Language) -> tuple[Counter, Counter]:
             skipped[(token.text, lemma, reason)] += 1
             continue
 
-        # 空文字や記号のみの場合はスキップ
+        # Skip if empty or symbols only
         if not lemma or not any(c.isalnum() for c in lemma):
             continue
 
@@ -215,10 +179,10 @@ def extract_lemmas(text: str, nlp: Language) -> tuple[Counter, Counter]:
 
 
 def save_to_csv(counter: Counter, filepath: Path) -> None:
-    """Counter を CSV ファイルに保存（頻度の降順）"""
+    """Save Counter to CSV file (sorted by frequency descending)"""
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    # 頻度の降順でソート
+    # Sort by frequency descending
     sorted_items = counter.most_common()
 
     with open(filepath, "w", encoding="utf-8", newline="") as f:
@@ -228,10 +192,10 @@ def save_to_csv(counter: Counter, filepath: Path) -> None:
             writer.writerow([word, freq])
 
 
-def find_difference(object_counter: Counter, ref_counter: Counter) -> Counter:
-    """reference に存在しない単語を抽出"""
+def find_difference(target_counter: Counter, ref_counter: Counter) -> Counter:
+    """Extract words that do not exist in reference"""
     diff = Counter()
-    for word, freq in object_counter.items():
+    for word, freq in target_counter.items():
         if word not in ref_counter:
             diff[word] = freq
     return diff
@@ -239,74 +203,74 @@ def find_difference(object_counter: Counter, ref_counter: Counter) -> Counter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="2つのテキストファイルを比較し、reference に存在しない単語を抽出する"
+        description="Compare two text files and extract words not present in reference"
     )
     parser.add_argument(
-        "--object",
+        "--target",
         required=True,
-        help="比較対象のテキストファイル",
+        help="Text file to compare",
     )
     parser.add_argument(
         "--ref",
         required=True,
-        help="基準となるテキストファイル",
+        help="Reference text file",
     )
     parser.add_argument(
         "--output",
         default="./output",
-        help="出力ディレクトリ（デフォルト: ./output）",
+        help="Output directory (default: ./output)",
     )
 
     args = parser.parse_args()
 
-    # 出力ディレクトリのパス
+    # Output directory path
     output_dir = Path(args.output)
 
-    print("spaCy モデルを読み込み中...")
+    print("Loading spaCy model...")
     nlp = spacy.load("en_core_web_sm")
 
-    # object ファイルの処理
-    print(f"処理中: {args.object}")
-    object_text = load_text(args.object)
-    object_counter, object_skipped = extract_lemmas(object_text, nlp)
+    # Process target file
+    print(f"Processing: {args.target}")
+    target_text = load_text(args.target)
+    target_counter, target_skipped = extract_lemmas(target_text, nlp)
 
-    # reference ファイルの処理
-    print(f"処理中: {args.ref}")
+    # Process reference file
+    print(f"Processing: {args.ref}")
     ref_text = load_text(args.ref)
     ref_counter, ref_skipped = extract_lemmas(ref_text, nlp)
 
-    # CSV 出力
-    object_csv = output_dir / "object_lemmatized.csv"
+    # CSV output
+    target_csv = output_dir / "target_lemmatized.csv"
     ref_csv = output_dir / "reference_lemmatized.csv"
     diff_csv = output_dir / "not_in_reference.csv"
-    object_skipped_csv = output_dir / "object_skipped.csv"
+    target_skipped_csv = output_dir / "target_skipped.csv"
     ref_skipped_csv = output_dir / "reference_skipped.csv"
 
-    print(f"出力中: {object_csv}")
-    save_to_csv(object_counter, object_csv)
+    print(f"Writing: {target_csv}")
+    save_to_csv(target_counter, target_csv)
 
-    print(f"出力中: {ref_csv}")
+    print(f"Writing: {ref_csv}")
     save_to_csv(ref_counter, ref_csv)
 
-    print(f"出力中: {object_skipped_csv}")
-    save_skipped_to_csv(object_skipped, object_skipped_csv)
+    print(f"Writing: {target_skipped_csv}")
+    save_skipped_to_csv(target_skipped, target_skipped_csv)
 
-    print(f"出力中: {ref_skipped_csv}")
+    print(f"Writing: {ref_skipped_csv}")
     save_skipped_to_csv(ref_skipped, ref_skipped_csv)
 
-    # 差分を計算
-    diff_counter = find_difference(object_counter, ref_counter)
+    # Calculate difference
+    diff_counter = find_difference(target_counter, ref_counter)
 
-    print(f"出力中: {diff_csv}")
+    print(f"Writing: {diff_csv}")
     save_to_csv(diff_counter, diff_csv)
 
-    # 結果サマリー
-    print("\n--- 結果サマリー ---")
-    print(f"object の単語数（ユニーク）: {len(object_counter)}")
-    print(f"object でスキップされた単語数: {len(object_skipped)}")
-    print(f"reference の単語数（ユニーク）: {len(ref_counter)}")
-    print(f"reference でスキップされた単語数: {len(ref_skipped)}")
-    print(f"reference にない単語数: {len(diff_counter)}")
+    # Result summary
+    print("\n--- Result Summary ---")
+    print(f"Target unique words: {len(target_counter)}")
+    print(f"Target skipped tokens: {len(target_skipped)}")
+    print(f"Reference unique words: {len(ref_counter)}")
+    print(f"Reference skipped tokens: {len(ref_skipped)}")
+    print(f"Words not in reference: {len(diff_counter)}")
 
 
 
